@@ -483,7 +483,7 @@ void handleHistory() {
 void showLcdStandby() {
   lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("    Akses AI    ");
+  lcd.print("    System ON    ");
   lcd.setCursor(0, 1);
   lcd.print(" Tempelkan Jari ");
 }
