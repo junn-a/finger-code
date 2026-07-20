@@ -4,17 +4,40 @@
 #include <Adafruit_Fingerprint.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <LittleFS.h>
+#include <EEPROM.h>
+
+// =====================================================================
+// CATATAN PORTING ESP32 -> ESP8266
+// - Preferences (NVS) diganti dengan EEPROM emulasi (flash) bawaan
+//   ESP8266: tiap ID (1-127) dapat slot 20 byte untuk nama pemiliknya.
+//   Total pemakaian ~2540 byte, dialokasikan via EEPROM.begin().
+//   Nama otomatis terpotong jika lebih dari 19 karakter.
+// - HardwareSerial(2) tidak ada di ESP8266, diganti SoftwareSerial di
+//   pin D5(RX)/D6(TX). Jika sensor sering gagal baca di 57600, coba
+//   turunkan baud rate sensor via AS608/R503 set baud command, atau
+//   pindahkan sensor ke Serial hardware (pin TX/RX bawaan, GPIO1/3)
+//   dan lepas kabel USB saat sensor aktif.
+// - esp_random() (ESP32-only) diganti fungsi random() bawaan Arduino
+//   yang di-seed dari noise ADC + micros().
+// - Pin default disesuaikan untuk board NodeMCU/Wemos D1 mini:
+//     Relay   -> D7 (GPIO13)
+//     I2C LCD -> SDA D2 (GPIO4), SCL D1 (GPIO5)
+//     Sensor  -> RX D5 (GPIO14), TX D6 (GPIO12)
+//   Hindari GPIO0/2/15 (strapping pin boot) dan GPIO6-11 (flash).
+// - FIX: server.collectHeaders() di ESP8266WebServer 3.1.2 memakai
+//   variadic template, bukan gaya lama (array, count). Sekarang
+//   dipanggil langsung dengan nama header: server.collectHeaders("Cookie");
+// =====================================================================
 
 // ---------- Relay ----------
-#define RELAY_PIN 14
-const unsigned long RELAY_ON_DURATION = 1000; // relay nyala lalu mati otomatis (ms)
+#define RELAY_PIN 13
+const unsigned long RELAY_ON_DURATION = 1000; // relay nyala lalu mati otomatis
 
 unsigned long relayOnAt = 0;
 bool relayIsOn = false;
 
 // ---------- WiFi AP ----------
-const char* AP_SSID = "Fingerprint-ESP8266-1";
+const char* AP_SSID = "Fingerprint-ESP8266";
 const char* AP_PASS = "12345678"; // min 8 karakter
 
 ESP8266WebServer server(80);
@@ -25,8 +48,9 @@ const char* ADMIN_PASS = "admin123";
 String sessionToken = ""; // kosong = belum ada yang login
 
 String generateToken() {
+  randomSeed(analogRead(A0) + micros());
   String t = "";
-  for (int i = 0; i < 4; i++) t += String(random(0, 0x7FFFFFFF), HEX);
+  for (int i = 0; i < 4; i++) t += String(random(0, 0xFFFFFF), HEX);
   return t;
 }
 
@@ -51,78 +75,44 @@ bool requireLogin() {
   return true;
 }
 
-// ---------- Sensor (SoftwareSerial, karena ESP8266 tidak punya UART bebas seperti ESP32) ----------
-SoftwareSerial mySerial(3, 1); // RX, TX
+// ---------- Sensor (SoftwareSerial, karena ESP8266 tidak punya UART bebas) ----------
+SoftwareSerial mySerial(14, 12); // RX, TX
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
 
 // ---------- LCD I2C ----------
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// ---------- Nama untuk tiap ID (PERSISTEN via LittleFS) ----------
-#define NAMES_FILE "/names.dat"
-String fingerNames[128]; // index 1..127 dipakai
-
-void loadNamesFromFS() {
-  for (int i = 0; i < 128; i++) fingerNames[i] = "";
-  if (!LittleFS.exists(NAMES_FILE)) return;
-  File f = LittleFS.open(NAMES_FILE, "r");
-  if (!f) return;
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-    int sep = line.indexOf('|');
-    if (sep == -1) continue;
-    int id = line.substring(0, sep).toInt();
-    String name = line.substring(sep + 1);
-    if (id >= 1 && id <= 127) fingerNames[id] = name;
-  }
-  f.close();
-}
-
-void saveNamesToFS() {
-  File f = LittleFS.open(NAMES_FILE, "w");
-  if (!f) return;
-  for (int i = 1; i <= 127; i++) {
-    if (fingerNames[i].length() > 0) {
-      f.print(i);
-      f.print("|");
-      f.print(fingerNames[i]);
-      f.print("\n");
-    }
-  }
-  f.close();
-}
+// ---------- Nama untuk tiap ID (PERSISTEN via EEPROM emulasi) ----------
+// Slot tetap 20 byte per ID (id 0 tidak dipakai, id 1-127 valid).
+#define NAME_SLOT_LEN 20
+#define EEPROM_SIZE (128 * NAME_SLOT_LEN) // ~2560 byte
 
 String getFingerName(int id) {
-  if (id < 1 || id > 127) return "";
-  return fingerNames[id];
+  int addr = id * NAME_SLOT_LEN;
+  char buf[NAME_SLOT_LEN + 1];
+  for (int i = 0; i < NAME_SLOT_LEN; i++) buf[i] = EEPROM.read(addr + i);
+  buf[NAME_SLOT_LEN] = 0;
+  String name = String(buf);
+  name.trim();
+  return name;
 }
 
 void setFingerName(int id, String name) {
-  if (id < 1 || id > 127) return;
-  fingerNames[id] = name;
-  saveNamesToFS();
+  int addr = id * NAME_SLOT_LEN;
+  char buf[NAME_SLOT_LEN];
+  memset(buf, 0, NAME_SLOT_LEN);
+  name.toCharArray(buf, NAME_SLOT_LEN); // otomatis terpotong jika kepanjangan
+  for (int i = 0; i < NAME_SLOT_LEN; i++) EEPROM.write(addr + i, buf[i]);
+  EEPROM.commit();
 }
 
 void deleteFingerName(int id) {
-  if (id < 1 || id > 127) return;
-  fingerNames[id] = "";
-  saveNamesToFS();
+  int addr = id * NAME_SLOT_LEN;
+  for (int i = 0; i < NAME_SLOT_LEN; i++) EEPROM.write(addr + i, 0);
+  EEPROM.commit();
 }
 
 String pendingEnrollName = "";
-
-// ---------- Cari ID kosong berikutnya secara otomatis ----------
-// ID terkecil yang BELUM terisi di sensor akan dipakai (mis. jika ID 1 sudah ada, defaultnya 2).
-int findNextAvailableId() {
-  for (int id = 1; id <= 127; id++) {
-    if (finger.loadModel(id) != FINGERPRINT_OK) {
-      return id;
-    }
-  }
-  return -1; // penuh
-}
 
 // ---------- Riwayat scan (RAM only, max 20 terakhir) ----------
 #define HISTORY_MAX 20
@@ -166,20 +156,7 @@ enum EnrollState {
 EnrollState state = ST_VERIFY_WAIT_FINGER;
 int enrollId = -1;
 
-// ---------- Hold non-blocking (pengganti delay() di state machine) ----------
-// Supaya loop() TIDAK PERNAH berhenti total. delay() yang lama bikin WiFi/HTTP macet
-// sesaat -> browser reconnect/reload -> input yang lagi diketik ilang.
-bool holding = false;
-unsigned long holdUntil = 0;
-int afterHoldState = ST_VERIFY_WAIT_FINGER; // disimpan sebagai int, bukan EnrollState, supaya tidak bentrok dgn auto-prototype Arduino IDE
-
-void startHold(unsigned long ms, int next) {
-  holding = true;
-  holdUntil = millis() + ms;
-  afterHoldState = next;
-}
-
-String statusMsg = "Sensor siap. Isi nama lalu klik Mulai Enroll.";
+String statusMsg = "Sensor siap. Masukkan ID lalu klik Mulai Enroll.";
 
 // ================= HTML: LOGIN =================
 const char LOGIN_HTML[] PROGMEM = R"rawliteral(
@@ -272,8 +249,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   button:disabled{opacity:0.5;cursor:not-allowed;}
   #status{margin-top:10px;padding:11px 13px;background:#f8fafc;border-radius:9px;font-size:13px;
           white-space:pre-line;border:1px solid #e2e8f0;color:#475569;}
-  .nextIdBox{margin-bottom:14px;padding:10px 12px;background:#eef2ff;border-radius:9px;
-             font-size:13px;color:#4338ca;font-weight:600;}
   .row{display:flex;justify-content:space-between;align-items:center;padding:11px 0;
        border-bottom:1px solid #f1f5f9;font-size:13.5px;}
   .row:last-child{border-bottom:none;}
@@ -301,7 +276,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     <div id="enroll" class="panel active">
       <h2>Enroll Sidik Jari Baru</h2>
-      <div class="nextIdBox">ID akan otomatis terpakai: <span id="nextIdDisplay">-</span></div>
+      <label>ID (1-127)</label>
+      <input type="number" id="fid" min="1" max="127" placeholder="Contoh: 5">
       <label>Nama Pemilik</label>
       <input type="text" id="fname" placeholder="Contoh: Budi">
       <button class="btn-primary" id="btnEnroll" onclick="startEnroll()">Mulai Enroll</button>
@@ -331,25 +307,15 @@ function showTab(id, btn){
   btn.classList.add('active');
   if(id === 'crud') loadList();
   if(id === 'history') loadHistory();
-  if(id === 'enroll') loadNextId();
-}
-
-function loadNextId(){
-  fetch('/nextid').then(r => r.text()).then(t => {
-    document.getElementById('nextIdDisplay').innerText = (t === '-1' ? 'Memori Penuh' : t);
-  });
 }
 
 function startEnroll(){
+  const id = document.getElementById('fid').value;
   const name = document.getElementById('fname').value.trim();
+  if(!id || id < 1 || id > 127){ alert('Isi ID 1-127'); return; }
   if(!name){ alert('Isi nama pemilik jari'); return; }
   document.getElementById('btnEnroll').disabled = true;
-  fetch('/enroll?name=' + encodeURIComponent(name)).then(r => r.text()).then(t => {
-    if(t.indexOf('OK') === -1){
-      alert(t);
-      document.getElementById('btnEnroll').disabled = false;
-      return;
-    }
+  fetch('/enroll?id=' + id + '&name=' + encodeURIComponent(name)).then(()=> {
     if(pollingEnroll) clearInterval(pollingEnroll);
     pollingEnroll = setInterval(pollStatus, 800);
   });
@@ -361,8 +327,6 @@ function pollStatus(){
     if(t.includes('BERHASIL') || t.includes('GAGAL') || t.includes('Error')){
       clearInterval(pollingEnroll);
       document.getElementById('btnEnroll').disabled = false;
-      document.getElementById('fname').value = '';
-      loadNextId();
     }
   });
 }
@@ -395,7 +359,7 @@ function renamePrompt(id){
 
 function deleteId(id){
   if(!confirm('Hapus sidik jari ID ' + id + ' dari sensor?')) return;
-  fetch('/delete?id=' + id).then(() => { loadList(); loadNextId(); });
+  fetch('/delete?id=' + id).then(() => loadList());
 }
 
 function loadHistory(){
@@ -414,7 +378,6 @@ function loadHistory(){
   });
 }
 
-loadNextId();
 setInterval(pollStatus, 1500);
 </script>
 </body>
@@ -453,26 +416,20 @@ void handleRoot() {
   server.send(200, "text/html", INDEX_HTML);
 }
 
-// ID sekarang ditentukan otomatis oleh server (slot kosong terkecil), client hanya kirim nama.
 void handleEnroll() {
   if (!requireLogin()) return;
   if (state >= ST_WAIT_FINGER_1 && state <= ST_STORE) {
     server.send(200, "text/plain", "Masih ada proses enroll berjalan.");
     return;
   }
-  if (!server.hasArg("name")) {
-    server.send(400, "text/plain", "Nama tidak ada");
+  if (!server.hasArg("id") || !server.hasArg("name")) {
+    server.send(400, "text/plain", "ID atau nama tidak ada");
     return;
   }
+  enrollId = server.arg("id").toInt();
   pendingEnrollName = server.arg("name");
-  if (pendingEnrollName.length() == 0) {
-    server.send(400, "text/plain", "Nama tidak boleh kosong");
-    return;
-  }
-
-  enrollId = findNextAvailableId();
-  if (enrollId == -1) {
-    server.send(400, "text/plain", "Memori sensor penuh, tidak ada ID tersedia");
+  if (enrollId < 1 || enrollId > 127 || pendingEnrollName.length() == 0) {
+    server.send(400, "text/plain", "ID harus 1-127 dan nama tidak boleh kosong");
     return;
   }
 
@@ -485,14 +442,7 @@ void handleEnroll() {
   lcd.setCursor(0, 1);
   lcd.print("Tempel Jari " + String(enrollId));
 
-  server.send(200, "text/plain", "OK;id=" + String(enrollId));
-}
-
-// Mengembalikan ID kosong berikutnya (dipakai frontend untuk ditampilkan sebelum enroll)
-void handleNextId() {
-  if (!requireLogin()) return;
-  int id = findNextAvailableId();
-  server.send(200, "text/plain", String(id));
+  server.send(200, "text/plain", "OK");
 }
 
 void handleStatus() {
@@ -500,7 +450,7 @@ void handleStatus() {
   server.send(200, "text/plain", statusMsg);
 }
 
-// List sekarang bersumber dari SENSOR langsung (bukan RAM), dipadukan dengan nama dari LittleFS
+// List sekarang bersumber dari SENSOR langsung (bukan RAM), dipadukan dengan nama dari EEPROM
 void handleList() {
   if (!requireLogin()) return;
   String json = "[";
@@ -593,17 +543,8 @@ void checkRelayTimeout() {
 
 // ================= State machine processor (non-blocking) =================
 void processStateMachine() {
-  // Sedang "hold" (menampilkan pesan) -> tunggu tanpa blocking loop().
-  if (holding) {
-    if (millis() >= holdUntil) {
-      holding = false;
-      state = (EnrollState)afterHoldState;
-    }
-    return;
-  }
-
   static unsigned long lastProcess = 0;
-  if (millis() - lastProcess < 200) return; // diperlambat dari 50ms -> 200ms, kurangi beban SoftwareSerial thd WiFi
+  if (millis() - lastProcess < 50) return;
   lastProcess = millis();
 
   int p;
@@ -618,6 +559,15 @@ void processStateMachine() {
         lcd.setCursor(0, 0);
         lcd.print("Memproses Jari..");
         state = ST_VERIFY_CONVERT;
+      } else if (p != FINGERPRINT_NOFINGER) {
+        // DEBUG: kalau ini muncul terus-menerus, komunikasi sensor bermasalah
+        // (bukan cuma "tidak ada jari" tapi error baca/komunikasi UART)
+        static unsigned long lastErrPrint = 0;
+        if (millis() - lastErrPrint > 2000) {
+          Serial.print("[DEBUG] getImage() kode error: ");
+          Serial.println(p);
+          lastErrPrint = millis();
+        }
       }
       break;
 
@@ -630,7 +580,8 @@ void processStateMachine() {
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("Scan Error!");
-        startHold(1500, ST_VERIFY_DONE);
+        delay(1500);
+        state = ST_VERIFY_DONE;
       }
       break;
 
@@ -660,10 +611,9 @@ void processStateMachine() {
         lcd.print("AKSES DITOLAK!");
         lcd.setCursor(0, 1);
         lcd.print(" Jari Tak Kenal ");
+        delay(2000);
 
         addHistory(0, "(tidak dikenal)", false);
-        startHold(2000, ST_VERIFY_DONE);
-        break;
       }
       state = ST_VERIFY_DONE;
       break;
@@ -757,8 +707,7 @@ void processStateMachine() {
         lcd.print("Enroll Sukses!");
         lcd.setCursor(0, 1);
         lcd.print(pendingEnrollName);
-        startHold(2000, ST_DONE);
-        break;
+        delay(2000);
       } else {
         statusMsg = "GAGAL menyimpan ke sensor";
       }
@@ -766,15 +715,15 @@ void processStateMachine() {
       break;
 
     case ST_DONE:
+    case ST_ERROR:
+      if (state == ST_ERROR) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Enroll Gagal!");
+        delay(2000);
+      }
       showLcdStandby();
       state = ST_VERIFY_WAIT_FINGER;
-      break;
-
-    case ST_ERROR:
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Enroll Gagal!");
-      startHold(2000, ST_DONE);
       break;
 
     default:
@@ -787,9 +736,6 @@ void processStateMachine() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.print("Reset reason: ");
-  Serial.println(ESP.getResetReason()); // untuk diagnosa kalau ESP tiba-tiba reset/reboot
-  randomSeed(analogRead(A0));
 
   Wire.begin(4, 5); // SDA, SCL
   delay(200);
@@ -804,29 +750,44 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
 
-  if (!LittleFS.begin()) {
-    Serial.println("Gagal mount LittleFS!");
-  }
-  loadNamesFromFS();
+  EEPROM.begin(EEPROM_SIZE);
 
   mySerial.begin(57600);
+  delay(200);
 
-  if (finger.verifyPassword()) {
+  Serial.println("=== DEBUG: Cek koneksi sensor fingerprint ===");
+  bool sensorOk = finger.verifyPassword();
+  Serial.print("verifyPassword() = ");
+  Serial.println(sensorOk ? "TRUE (OK)" : "FALSE (GAGAL)");
+
+  if (sensorOk) {
     Serial.println("Sensor fingerprint terdeteksi.");
     finger.getParameters();
+    Serial.print("Status register : 0x"); Serial.println(finger.status_reg, HEX);
+    Serial.print("System ID       : 0x"); Serial.println(finger.system_id, HEX);
+    Serial.print("Capacity        : "); Serial.println(finger.capacity);
+    Serial.print("Security level  : "); Serial.println(finger.security_level);
+    Serial.print("Device address  : 0x"); Serial.println(finger.device_addr, HEX);
+    Serial.print("Packet length   : "); Serial.println(finger.packet_len);
+    Serial.print("Baud rate       : "); Serial.println(finger.baud_rate);
   } else {
-    Serial.println("Sensor TIDAK terdeteksi, cek wiring!");
+    Serial.println("Sensor TIDAK terdeteksi, cek wiring/baud/power!");
+    Serial.println("  - Pastikan TX sensor -> RX ESP (GPIO14/D5)");
+    Serial.println("  - Pastikan RX sensor -> TX ESP (GPIO12/D6)");
+    Serial.println("  - Pastikan GND sensor & ESP nyambung (common ground)");
+    Serial.println("  - Coba beri VCC sensor dari sumber 5V terpisah");
+    Serial.println("  - Kalau tetap gagal, coba turunkan baud rate di bawah");
     lcd.setCursor(0, 1);
     lcd.print("Sensor Error!   ");
   }
+  Serial.println("=== DEBUG selesai ===");
 
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.print("AP IP address: ");
   Serial.println(WiFi.softAPIP());
 
-  // Wajib supaya server.header("Cookie") bisa dibaca.
-  // Core ESP8266WebServer versi baru (>=3.x) pakai signature variadic:
-  // collectHeaders("Header1", "Header2", ...) -- BUKAN collectHeaders(array, count) gaya lama.
+  // FIX: gaya baru ESP8266WebServer 3.1.2 (variadic template), bukan
+  // (array, count) seperti sebelumnya. Cukup panggil nama headernya.
   server.collectHeaders("Cookie");
 
   server.on("/login", HTTP_GET, handleLoginPage);
@@ -835,7 +796,6 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/enroll", handleEnroll);
-  server.on("/nextid", handleNextId);
   server.on("/status", handleStatus);
   server.on("/list", handleList);
   server.on("/rename", handleRename);
